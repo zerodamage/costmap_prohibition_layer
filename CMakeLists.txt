@@ -5,6 +5,7 @@ project(costmap_prohibition_layer)
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
+  costmap_converter
   costmap_2d
   dynamic_reconfigure
   roscpp
@@ -113,7 +114,7 @@ generate_dynamic_reconfigure_options(
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES costmap_prohibition_layer
-  CATKIN_DEPENDS costmap_2d dynamic_reconfigure
+  CATKIN_DEPENDS costmap_converter costmap_2d dynamic_reconfigure
   DEPENDS
 )
 

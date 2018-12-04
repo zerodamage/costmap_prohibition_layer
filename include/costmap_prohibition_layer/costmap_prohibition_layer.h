@@ -43,12 +43,17 @@
 #include <tf/transform_datatypes.h>
 #include <mutex>
 #include <geometry_msgs/PoseArray.h>
+#include <geometry_msgs/Polygon.h>
+#include <geometry_msgs/PolygonStamped.h>
+#include <costmap_converter/ObstacleMsg.h>
 #include <stdlib.h>
 #include <ros/ros.h>
-#include <costmap_2d/layer.h>
+#include <costmap_2d/costmap_layer.h>
 #include <costmap_2d/layered_costmap.h>
 #include <costmap_prohibition_layer/CostmapProhibitionLayerConfig.h>
 #include <dynamic_reconfigure/server.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <map_msgs/OccupancyGridUpdate.h>
 
 #include <unordered_map>
 
@@ -62,7 +67,7 @@ struct PointInt
     int y;
 };
     
-class CostmapProhibitionLayer : public costmap_2d::Layer
+class CostmapProhibitionLayer : public costmap_2d::CostmapLayer
 {
 public:
     
@@ -98,11 +103,15 @@ public:
   virtual void updateCosts(costmap_2d::Costmap2D& master_grid, int min_i, int min_j,
                            int max_i, int max_j);
 
+  virtual void matchSize();
+
 private:
     
   /**
    * overlayed reconfigure callback function
    */
+  void incomingMap(const nav_msgs::OccupancyGridConstPtr& new_map);
+  void incomingUpdate(const map_msgs::OccupancyGridUpdateConstPtr& update);
   void reconfigureCB(CostmapProhibitionLayerConfig& config, uint32_t level);
 
   /**
@@ -123,7 +132,7 @@ private:
    * @param max_j          maximum bound on the vertical map index/coordinate
    * @param fill_polygon   if true, tue cost for the interior of the polygon will be set as well    
    */
-  void setPolygonCost(costmap_2d::Costmap2D &master_grid, const std::vector<geometry_msgs::Point>& polygon,
+  void setPolygonCost(costmap_2d::Costmap2D &master_grid, const geometry_msgs::Polygon& polygon,
                       unsigned char cost, int min_i, int min_j, int max_i, int max_j, bool fill_polygon);
   
   /**
@@ -192,14 +201,22 @@ private:
  *                    false if it wasn't
   */
   bool getPoint(XmlRpc::XmlRpcValue& val, geometry_msgs::Point& point);
+  bool getPoint(XmlRpc::XmlRpcValue& val, geometry_msgs::Point32& point);
 
+  std::string global_frame_;  ///< @brief The global frame for the costmap
+  std::string map_frame_;  /// @brief frame that map is located in
   dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>* _dsrv;            //!< dynamic_reconfigure server for the costmap
   std::mutex _data_mutex;                                                       //!< mutex for the accessing _prohibition_points and _prohibition_polygons
   double _costmap_resolution;                                                   //!< resolution of the overlayed costmap to create the thinnest line out of two points
   bool _fill_polygons;                                                          //!< if true, all cells that are located in the interior of polygons are marked as obstacle as well
+  bool subscribe_to_updates_;
+  bool map_received_;
+  bool has_updated_data_;
   std::vector<geometry_msgs::Point> _prohibition_points;                        //!< vector to save the lonely points in source coordinates
-  std::vector<std::vector<geometry_msgs::Point>> _prohibition_polygons;         //!< vector to save the polygons (including lines) in source coordinates
+  std::vector<geometry_msgs::Polygon> _prohibition_polygons;                    //!< vector to save the polygons (including lines) in source coordinates
   double _min_x, _min_y, _max_x, _max_y;                                        //!< cached map bounds
+  unsigned int x_, y_, width_, height_;
+  ros::Subscriber map_sub_, map_update_sub_;
 };
 }
 #endif

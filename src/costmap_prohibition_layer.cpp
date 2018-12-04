@@ -38,10 +38,12 @@
 
 #include <costmap_prohibition_layer/costmap_prohibition_layer.h>
 #include <pluginlib/class_list_macros.h>
+#include <costmap_2d/costmap_math.h>
 
 PLUGINLIB_EXPORT_CLASS(costmap_prohibition_layer_namespace::CostmapProhibitionLayer, costmap_2d::Layer)
 
 using costmap_2d::LETHAL_OBSTACLE;
+using costmap_2d::Costmap2D;
 
 namespace costmap_prohibition_layer_namespace
 {
@@ -58,13 +60,53 @@ CostmapProhibitionLayer::~CostmapProhibitionLayer()
 
 void CostmapProhibitionLayer::onInitialize()
 {
-  ros::NodeHandle nh("~/" + name_);
+  ros::NodeHandle nh("~/" + name_), g_nh;
   current_ = true;
+
+  if (_dsrv)
+  {
+    delete _dsrv;
+  }
 
   _dsrv = new dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>(nh);
   dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>::CallbackType cb =
       boost::bind(&CostmapProhibitionLayer::reconfigureCB, this, _1, _2);
   _dsrv->setCallback(cb);
+
+  global_frame_ = layered_costmap_->getGlobalFrameID();
+
+  std::string map_topic;
+  nh.param("map_topic", map_topic, std::string("map"));
+
+  // Only resubscribe if topic has changed
+  if (map_sub_.getTopic() != ros::names::resolve(map_topic))
+  {
+    // we'll subscribe to the latched topic that the map server uses
+    ROS_INFO("Requesting the map...");
+    map_sub_ = g_nh.subscribe(map_topic, 1, &CostmapProhibitionLayer::incomingMap, this);
+    map_received_ = false;
+    has_updated_data_ = false;
+
+    ros::Rate r(10);
+    while (!map_received_ && g_nh.ok())
+    {
+      ros::spinOnce();
+      r.sleep();
+    }
+
+    ROS_INFO("Received a %d X %d map at %f m/pix", getSizeInCellsX(), getSizeInCellsY(), getResolution());
+
+    if (subscribe_to_updates_)
+    {
+      ROS_INFO("Subscribing to updates");
+      map_update_sub_ = g_nh.subscribe(map_topic + "_updates", 10, &CostmapProhibitionLayer::incomingUpdate, this);
+
+    }
+  }
+  else
+  {
+    has_updated_data_ = true;
+  }
 
   // get a pointer to the layered costmap and save resolution
   costmap_2d::Costmap2D *costmap = layered_costmap_->getCostmap();
@@ -148,10 +190,10 @@ void CostmapProhibitionLayer::computeMapBounds()
   // iterate polygons
   for (int i = 0; i < _prohibition_polygons.size(); ++i)
   {
-    for (int j=0; j < _prohibition_polygons.at(i).size(); ++j)
+    for (int j=0; j < _prohibition_polygons.at(i).points.size(); ++j)
     {
-      double px = _prohibition_polygons.at(i).at(j).x;
-      double py = _prohibition_polygons.at(i).at(j).y;
+      double px = _prohibition_polygons.at(i).points.at(j).x;
+      double py = _prohibition_polygons.at(i).points.at(j).y;
       _min_x = std::min(px, _min_x);
       _min_y = std::min(py, _min_y);
       _max_x = std::max(px, _max_x);
@@ -172,14 +214,14 @@ void CostmapProhibitionLayer::computeMapBounds()
 }
 
 
-void CostmapProhibitionLayer::setPolygonCost(costmap_2d::Costmap2D &master_grid, const std::vector<geometry_msgs::Point>& polygon, unsigned char cost,
+void CostmapProhibitionLayer::setPolygonCost(costmap_2d::Costmap2D &master_grid, const geometry_msgs::Polygon& polygon, unsigned char cost,
                                              int min_i, int min_j, int max_i, int max_j, bool fill_polygon)
 {
     std::vector<PointInt> map_polygon;
-    for (unsigned int i = 0; i < polygon.size(); ++i)
+    for (unsigned int i = 0; i < polygon.points.size(); ++i)
     {
         PointInt loc;
-        master_grid.worldToMapNoBounds(polygon[i].x, polygon[i].y, loc.x, loc.y);
+        master_grid.worldToMapNoBounds(polygon.points[i].x, polygon.points[i].y, loc.x, loc.y);
         map_polygon.push_back(loc);
     }
 
@@ -246,6 +288,56 @@ void CostmapProhibitionLayer::raytrace(int x0, int y0, int x1, int y1, std::vect
             error += dx;
         }
     }
+}
+
+void CostmapProhibitionLayer::incomingMap(const nav_msgs::OccupancyGridConstPtr& new_map)
+{
+  unsigned int size_x = new_map->info.width, size_y = new_map->info.height;
+
+  ROS_DEBUG("Received a %d X %d map at %f m/pix", size_x, size_y, new_map->info.resolution);
+
+  // resize costmap if size, resolution or origin do not match
+  Costmap2D* master = layered_costmap_->getCostmap();
+  if (!layered_costmap_->isRolling() && (master->getSizeInCellsX() != size_x ||
+      master->getSizeInCellsY() != size_y ||
+      master->getResolution() != new_map->info.resolution ||
+      master->getOriginX() != new_map->info.origin.position.x ||
+      master->getOriginY() != new_map->info.origin.position.y ||
+      !layered_costmap_->isSizeLocked()))
+  {
+    // Update the size of the layered costmap (and all layers, including this one)
+    ROS_INFO("Resizing costmap to %d X %d at %f m/pix", size_x, size_y, new_map->info.resolution);
+    layered_costmap_->resizeMap(size_x, size_y, new_map->info.resolution, new_map->info.origin.position.x,
+                                new_map->info.origin.position.y, true);
+  }
+
+  unsigned int index = 0;
+
+  // initialize the costmap with the prohibition regions
+  /*for (unsigned int i = 0; i < size_y; ++i)
+  {
+    for (unsigned int j = 0; j < size_x; ++j)
+    {
+      unsigned char value = new_map->data[index];
+      costmap_[index] = interpretValue(value);
+      ++index;
+    }
+  }*/
+  map_frame_ = new_map->header.frame_id;
+
+  // we have a new map, update full size of map
+  x_ = y_ = 0;
+  width_ = size_x_;
+  height_ = size_y_;
+  map_received_ = true;
+  has_updated_data_ = true;
+
+  // shutdown the map subscrber if firt_map_only_ flag is on
+  /*if (first_map_only_)
+  {
+    ROS_INFO("Shutting down the map subscriber. first_map_only flag is on");
+    map_sub_.shutdown();
+  }*/
 }
 
 
@@ -343,7 +435,7 @@ bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhan
       {
         if (param_yaml[i].getType() == XmlRpc::XmlRpcValue::TypeArray)
         {
-          std::vector<geometry_msgs::Point> vector_to_add;
+          geometry_msgs::Polygon polygon_to_add;
 
           /* **************************************
            * differ between points and polygons
@@ -372,13 +464,13 @@ bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhan
             else
             {
               // add a line!
-              geometry_msgs::Point point_A;
+              geometry_msgs::Point32 point_A;
               ret_val = getPoint(param_yaml[i][0], point_A);
-              vector_to_add.push_back(point_A);
+              polygon_to_add.points.push_back(point_A);
 
-              geometry_msgs::Point point_B;
+              geometry_msgs::Point32 point_B;
               ret_val = getPoint(param_yaml[i][1], point_B);
-              vector_to_add.push_back(point_B);
+              polygon_to_add.points.push_back(point_B);
 
               // calculate the normal vector for AB
               geometry_msgs::Point point_N;
@@ -392,16 +484,16 @@ bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhan
               point_N.y = point_N.y / abs_N * _costmap_resolution;
 
               // calculate the new points to get a polygon which can be filled
-              geometry_msgs::Point point;
+              geometry_msgs::Point32 point;
               point.x = point_A.x + point_N.x;
               point.y = point_A.y + point_N.y;
-              vector_to_add.push_back(point);
+              polygon_to_add.points.push_back(point);
 
               point.x = point_B.x + point_N.x;
               point.y = point_B.y + point_N.y;
-              vector_to_add.push_back(point);
+              polygon_to_add.points.push_back(point);
 
-              _prohibition_polygons.push_back(vector_to_add);
+              _prohibition_polygons.push_back(polygon_to_add);
             }
           }
           // add a point or add a polygon
@@ -410,11 +502,11 @@ bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhan
             // add a polygon with any number of points
             for (int j = 0; j < param_yaml[i].size(); ++j)
             {
-              geometry_msgs::Point point;
+              geometry_msgs::Point32 point;
               ret_val = getPoint(param_yaml[i][j], point);
-              vector_to_add.push_back(point);
+              polygon_to_add.points.push_back(point);
             }
-            _prohibition_polygons.push_back(vector_to_add);
+            _prohibition_polygons.push_back(polygon_to_add);
           }
         }
         else
@@ -440,6 +532,38 @@ bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhan
 
 // get a point out of the XML Type into a geometry_msgs::Point
 bool CostmapProhibitionLayer::getPoint(XmlRpc::XmlRpcValue &val, geometry_msgs::Point &point)
+{
+  try
+  {
+    // check if there a two values for the coordinate
+    if (val.getType() == XmlRpc::XmlRpcValue::TypeArray && val.size() == 2)
+    {
+      auto convDouble = [](XmlRpc::XmlRpcValue &val) -> double
+      {
+        if (val.getType() == XmlRpc::XmlRpcValue::TypeInt)  // XmlRpc cannot cast int to double
+          return int(val);
+        return val;  // if not double, an exception is thrown;
+      };
+
+      point.x = convDouble(val[0]);
+      point.y = convDouble(val[1]);
+      point.z = 0.0;
+      return true;
+    }
+    else
+    {
+      ROS_ERROR_STREAM("Prohibition_Layer: A point has to consist two values!");
+      return false;
+    }
+  }
+  catch (const XmlRpc::XmlRpcException &ex)
+  {
+    ROS_ERROR_STREAM("Prohibition Layer: Cannot add current point: " << ex.getMessage());
+    return false;
+  }
+}
+
+bool CostmapProhibitionLayer::getPoint(XmlRpc::XmlRpcValue &val, geometry_msgs::Point32 &point)
 {
   try
   {
